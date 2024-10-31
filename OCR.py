@@ -4,7 +4,8 @@ import traceback
 import asyncio
 import json
 import re
-import urllib.request
+import aiohttp
+import aiofiles
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import warnings
@@ -19,25 +20,52 @@ from decouple import Config as DecoupleConfig, RepositoryEnv
 import cv2
 from filelock import FileLock, Timeout
 from transformers import AutoTokenizer
-from openai import AsyncOpenAI
-from anthropic import AsyncAnthropic
+import subprocess
+from tqdm.asyncio import tqdm_asyncio
+from tqdm import tqdm
+
+# Added Math OCR dependency
+try:
+    import mathpixocr  # Replace with the actual Math OCR library you are using
+    MATH_OCR_AVAILABLE = True
+except ImportError:
+    MATH_OCR_AVAILABLE = False
+    logging.warning("Math OCR library not found. Math formulas will not be processed with specialized OCR.")
+
 try:
     import nvgpu
     GPU_AVAILABLE = True
 except ImportError:
     GPU_AVAILABLE = False
-        
+
+# Added PaddleOCR dependency
+try:
+    from paddleocr import PaddleOCR, draw_ocr
+    PADDLE_OCR_AVAILABLE = True
+except ImportError:
+    PADDLE_OCR_AVAILABLE = False
+    logging.warning("PaddleOCR library not found. PaddleOCR will not be used as a backup OCR engine.")
+
+# Added Text Detection Models
+try:
+    from east import EASTTextDetector  # Placeholder for actual EAST import
+    from craft import CRAFTTextDetector  # Placeholder for actual CRAFT import
+    TEXT_DETECTION_AVAILABLE = True
+except ImportError:
+    TEXT_DETECTION_AVAILABLE = False
+    logging.warning("Text detection models (EAST/CRAFT) not found. Advanced text detection will not be used.")
+
 # Configuration
 config = DecoupleConfig(RepositoryEnv('.env'))
 
-USE_LOCAL_LLM = config.get("USE_LOCAL_LLM", default=False, cast=bool)
-API_PROVIDER = config.get("API_PROVIDER", default="OPENAI", cast=str) # OPENAI or CLAUDE
-ANTHROPIC_API_KEY = config.get("ANTHROPIC_API_KEY", default="your-anthropic-api-key", cast=str)
-OPENAI_API_KEY = config.get("OPENAI_API_KEY", default="your-openai-api-key", cast=str)
+USE_LOCAL_LLM = config.get("USE_LOCAL_LLM", default=True, cast=bool)
+API_PROVIDER = config.get("API_PROVIDER", default="OLLAMA", cast=str)  # OLLAMA or LOCAL
+OLLAMA_API_URL = config.get("OLLAMA_API_URL", default="http://localhost:11434", cast=str)
+OLLAMA_MODEL_NAME = config.get("OLLAMA_MODEL_NAME", default="ggml-gpt4all-j-v1.3-groovy", cast=str)
 CLAUDE_MODEL_STRING = config.get("CLAUDE_MODEL_STRING", default="claude-3-haiku-20240307", cast=str)
-CLAUDE_MAX_TOKENS = 4096 # Maximum allowed tokens for Claude API
+CLAUDE_MAX_TOKENS = 4096  # Maximum allowed tokens for Claude API
 TOKEN_BUFFER = 500  # Buffer to account for token estimation inaccuracies
-TOKEN_CUSHION = 300 # Don't use the full max tokens to avoid hitting the limit
+TOKEN_CUSHION = 300  # Don't use the full max tokens to avoid hitting the limit
 OPENAI_COMPLETION_MODEL = config.get("OPENAI_COMPLETION_MODEL", default="gpt-4o-mini", cast=str)
 OPENAI_EMBEDDING_MODEL = config.get("OPENAI_EMBEDDING_MODEL", default="text-embedding-3-small", cast=str)
 OPENAI_MAX_TOKENS = 12000  # Maximum allowed tokens for OpenAI API
@@ -45,68 +73,396 @@ DEFAULT_LOCAL_MODEL_NAME = "Llama-3.1-8B-Lexi-Uncensored_Q5_fixedrope.gguf"
 LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS = 2048
 USE_VERBOSE = False
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Added Math OCR configuration
+MATH_OCR_API_KEY = config.get("MATH_OCR_API_KEY", default="", cast=str)
+MATH_OCR_ENDPOINT = config.get("MATH_OCR_ENDPOINT", default="", cast=str)  # If required by the Math OCR tool
+
+# Added LLM Models for Error Correction and Layout Identification
+LLM_ERROR_CORRECTION_MODEL = config.get("LLM_ERROR_CORRECTION_MODEL", default=DEFAULT_LOCAL_MODEL_NAME, cast=str)
+LLM_LAYOUT_MODEL = config.get("LLM_LAYOUT_MODEL", default=DEFAULT_LOCAL_MODEL_NAME, cast=str)
+
+# Added Preprocessing and Progress Tracking configurations
+PREPROCESSING_ENABLED = config.get("PREPROCESSING_ENABLED", default=True, cast=bool)
+PROGRESS_TRACKING_ENABLED = config.get("PROGRESS_TRACKING_ENABLED", default=True, cast=bool)
+
+# Added OCR Engine Selection
+OCR_ENGINE = config.get("OCR_ENGINE", default="pytesseract", cast=str)  # Options: pytesseract, easyocr
+
+# Added PaddleOCR configuration
+PADDLEOCR_ENABLED = config.get("PADDLEOCR_ENABLED", default=True, cast=bool)
+PADDLEOCR_LANGUAGE = config.get("PADDLEOCR_LANGUAGE", default="en", cast=str)  # e.g., 'en' for English
+PADDLEOCR_USE_GPU = config.get("PADDLEOCR_USE_GPU", default=False, cast=bool)
+
+# Added Text Detection configuration
+TEXT_DETECTION_MODEL = config.get("TEXT_DETECTION_MODEL", default="EAST", cast=str)  # Options: EAST, CRAFT
+TEXT_DETECTION_THRESHOLD = config.get("TEXT_DETECTION_THRESHOLD", default=0.5, cast=float)
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # GPU Check
-def is_gpu_available():
-    if not GPU_AVAILABLE:
-        logging.warning("GPU support not available: nvgpu module not found")
-        return {"gpu_found": False, "num_gpus": 0, "first_gpu_vram": 0, "total_vram": 0, "error": "nvgpu module not found"}
-    try:
-        gpu_info = nvgpu.gpu_info()
-        num_gpus = len(gpu_info)
-        if num_gpus == 0:
-            logging.warning("No GPUs found on the system")
-            return {"gpu_found": False, "num_gpus": 0, "first_gpu_vram": 0, "total_vram": 0}
-        first_gpu_vram = gpu_info[0]['mem_total']
-        total_vram = sum(gpu['mem_total'] for gpu in gpu_info)
-        logging.info(f"GPU(s) found: {num_gpus}, Total VRAM: {total_vram} MB")
-        return {"gpu_found": True, "num_gpus": num_gpus, "first_gpu_vram": first_gpu_vram, "total_vram": total_vram, "gpu_info": gpu_info}
-    except Exception as e:
-        logging.error(f"Error checking GPU availability: {e}")
-        return {"gpu_found": False, "num_gpus": 0, "first_gpu_vram": 0, "total_vram": 0, "error": str(e)}
+if GPU_AVAILABLE:
+    logging.info("GPU is available and will be utilized where applicable.")
+else:
+    logging.info("GPU is not available. Processing will proceed on CPU.")
 
-# Model Download
+# Initialize OCR Engines
+if OCR_ENGINE.lower() == "pytesseract":
+    logging.info("Using pytesseract as the primary OCR engine.")
+elif OCR_ENGINE.lower() == "easyocr":
+    try:
+        import easyocr
+        OCR_ENGINE_AVAILABLE = True
+        logging.info("Using EasyOCR as the primary OCR engine.")
+    except ImportError:
+        OCR_ENGINE_AVAILABLE = False
+        logging.error("EasyOCR is selected as the OCR engine but is not installed.")
+        OCR_ENGINE = "pytesseract"
+else:
+    logging.warning(f"Unsupported OCR engine: {OCR_ENGINE}. Falling back to pytesseract.")
+    OCR_ENGINE = "pytesseract"
+
+# Initialize PaddleOCR
+if PADDLEOCR_ENABLED and PADDLE_OCR_AVAILABLE:
+    paddleocr_instance = PaddleOCR(
+        lang=PADDLEOCR_LANGUAGE,
+        use_angle_cls=True,
+        use_gpu=PADDLEOCR_USE_GPU
+    )
+    logging.info("PaddleOCR is enabled and initialized.")
+else:
+    paddleocr_instance = None
+    if PADDLEOCR_ENABLED:
+        logging.warning("PaddleOCR is enabled but not available.")
+    else:
+        logging.info("PaddleOCR is disabled.")
+
+# Initialize Text Detection Models
+if TEXT_DETECTION_AVAILABLE:
+    if TEXT_DETECTION_MODEL.upper() == "EAST":
+        text_detector = EASTTextDetector(model_path=config.get("EAST_MODEL_PATH", default="models/east_text_detection.pth", cast=str))
+        logging.info("EAST Text Detector initialized.")
+    elif TEXT_DETECTION_MODEL.upper() == "CRAFT":
+        text_detector = CRAFTTextDetector(model_path=config.get("CRAFT_MODEL_PATH", default="models/craft_text_detection.pth", cast=str))
+        logging.info("CRAFT Text Detector initialized.")
+    else:
+        text_detector = None
+        logging.warning(f"Unsupported Text Detection Model: {TEXT_DETECTION_MODEL}. Advanced text detection will not be used.")
+else:
+    text_detector = None
+    logging.info("Advanced Text Detection models are not available.")
+
+async def convert_pdf_to_images(pdf_path: str, max_pages: int = 0, skip_first_n_pages: int = 0) -> List[Image.Image]:
+    """
+    Converts a PDF file to a list of PIL Image objects asynchronously.
+
+    Args:
+        pdf_path (str): Path to the PDF file.
+        max_pages (int, optional): Maximum number of pages to convert. Defaults to 0 (all pages).
+        skip_first_n_pages (int, optional): Number of initial pages to skip. Defaults to 0.
+
+    Returns:
+        List[Image.Image]: List of images converted from PDF pages.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        images = await loop.run_in_executor(None, convert_from_path, pdf_path, skip_first_n_pages + 1, max_pages if max_pages > 0 else None)
+        logging.info(f"Converted PDF to {len(images)} images.")
+        return images
+    except Exception as e:
+        logging.error(f"Failed to convert PDF to images: {e}")
+        return []
+
+def detect_text_regions(image: Image.Image) -> List[Tuple[int, int, int, int]]:
+    """
+    Detects text regions in an image using the initialized text detector.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        List[Tuple[int, int, int, int]]: List of bounding boxes for detected text regions.
+    """
+    if not text_detector:
+        logging.warning("Text detection is not initialized.")
+        return [(0, 0, image.width, image.height)]  # Whole image as one region
+
+    logging.info(f"Detecting text regions using {TEXT_DETECTION_MODEL}.")
+    regions = text_detector.detect(image)
+    logging.info(f"Detected {len(regions)} text regions.")
+    return regions
+
+def classify_text_type(text: str) -> str:
+    """
+    Classifies the type of text based on heuristics.
+
+    Args:
+        text (str): The text to classify.
+
+    Returns:
+        str: The classified text type ('Math', 'Handwrite', or 'Text').
+    """
+    math_pattern = r'[\$\\](.*?)[\$\\]'  # Detect LaTeX math
+    handwriting_pattern = r'[A-Za-z]{1,}\b'  # Placeholder for handwriting detection
+
+    if re.search(math_pattern, text):
+        return "Math"
+    elif re.search(handwriting_pattern, text):
+        return "Handwrite"
+    else:
+        return "Text"
+
+def pytesseract_ocr(image: Image.Image) -> Tuple[str, float]:
+    """
+    Performs OCR using pytesseract on the given image.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Extracted text and average confidence.
+    """
+    try:
+        custom_config = r'--oem 3 --psm 6'
+        data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
+        text = ' '.join(data['text'])
+        confidences = [int(conf) for conf in data['conf'] if conf.isdigit()]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return text, avg_conf
+    except Exception as e:
+        logging.error(f"pytesseract OCR failed: {e}")
+        return "", 0.0
+
+def easyocr_ocr(image: Image.Image) -> Tuple[str, float]:
+    """
+    Performs OCR using EasyOCR on the given image.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Extracted text and average confidence.
+    """
+    try:
+        reader = easyocr.Reader(['en'], gpu=PADDLEOCR_USE_GPU if PADDLE_OCR_AVAILABLE else False)
+        result = reader.readtext(np.array(image), detail=1, paragraph=False)
+        text = ' '.join([res[1] for res in result])
+        confidences = [res[2] for res in result]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return text, avg_conf
+    except Exception as e:
+        logging.error(f"EasyOCR failed: {e}")
+        return "", 0.0
+
+def paddleocr_ocr(image: Image.Image) -> Tuple[str, float]:
+    """
+    Performs OCR using PaddleOCR on the given image.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Extracted text and average confidence.
+    """
+    if not paddleocr_instance:
+        logging.warning("PaddleOCR is not initialized.")
+        return "", 0.0
+    try:
+        result = paddleocr_instance.ocr(np.array(image), rec=True, cls=True)
+        text = ' '.join([line[1][0] for line in result])
+        confidences = [line[1][1] for line in result]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return text, avg_conf
+    except Exception as e:
+        logging.error(f"PaddleOCR failed: {e}")
+        return "", 0.0
+
+async def ocr_image(image: Image.Image) -> Tuple[str, float]:
+    """
+    Performs unified OCR on the given image using the selected OCR engine and backups.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Extracted text and average confidence.
+    """
+    try:
+        # Detect text regions
+        regions = detect_text_regions(image)
+
+        extracted_text = []
+        confidences = []
+
+        for region in regions:
+            x, y, w, h = region
+            cropped_image = image.crop((x, y, x + w, y + h))
+
+            # Choose OCR Engine
+            if OCR_ENGINE.lower() == "pytesseract":
+                text, conf = pytesseract_ocr(cropped_image)
+            elif OCR_ENGINE.lower() == "easyocr" and OCR_ENGINE_AVAILABLE:
+                text, conf = easyocr_ocr(cropped_image)
+            else:
+                logging.warning(f"Unsupported OCR engine: {OCR_ENGINE}. Falling back to pytesseract.")
+                text, conf = pytesseract_ocr(cropped_image)
+
+            extracted_text.append(text)
+            confidences.append(conf)
+
+        combined_text = ' '.join(extracted_text)
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+
+        # If confidence is low, use PaddleOCR as backup
+        CONFIDENCE_THRESHOLD = 80.0
+        if avg_conf < CONFIDENCE_THRESHOLD and PADDLEOCR_ENABLED and PADDLE_OCR_AVAILABLE:
+            logging.info(f"Average OCR confidence ({avg_conf:.2f}) is below threshold ({CONFIDENCE_THRESHOLD}). Using PaddleOCR as backup.")
+            backup_text, backup_conf = paddleocr_ocr(image)
+            if backup_conf > avg_conf:
+                combined_text = backup_text
+                avg_conf = backup_conf
+                logging.info(f"Switched to PaddleOCR with higher confidence: {avg_conf:.2f}")
+
+        return combined_text, avg_conf
+    except Exception as e:
+        logging.error(f"Error during OCR processing: {e}")
+        return "", 0.0
+
+def process_handwritten_text_sync(image: Image.Image) -> Tuple[str, float]:
+    """
+    Processes handwritten text in the image using optimized OCR settings.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Processed text and average confidence.
+    """
+    try:
+        # Placeholder for handwriting-specific OCR processing
+        # This could involve using a specialized model or service
+        # For demonstration, we'll use pytesseract with different configs
+        custom_config = r'--oem 1 --psm 7'  # OEM and PSM settings optimized for handwriting
+        data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
+        text = ' '.join(data['text'])
+        confidences = [int(conf) for conf in data['conf'] if conf.isdigit()]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return text, avg_conf
+    except Exception as e:
+        logging.error(f"Handwriting OCR failed: {e}")
+        return "", 0.0
+
+async def process_handwritten_text(text: str) -> str:
+    """
+    Processes handwritten text in the image using optimized OCR settings.
+
+    Args:
+        text (str): The text to process.
+
+    Returns:
+        str: Processed text.
+    """
+    try:
+        # Assuming 'text' is image data in some form; adjust as needed
+        image = Image.fromarray(np.array(text))
+        processed_text, conf = await asyncio.to_thread(process_handwritten_text_sync, image)
+        logging.info(f"Processed handwritten text with confidence: {conf:.2f}")
+        return processed_text
+    except Exception as e:
+        logging.error(f"Error processing handwritten text: {e}")
+        return text
+
+async def classify_and_process_text(text: str) -> str:
+    """
+    Classifies the text type and processes it accordingly using LLM.
+
+    Args:
+        text (str): The text to process.
+
+    Returns:
+        str: Processed text.
+    """
+    text_type = classify_text_type(text)
+    logging.info(f"Classified text as: {text_type}")
+
+    if text_type == "Math" and MATH_OCR_AVAILABLE:
+        try:
+            math_text = await asyncio.to_thread(mathpixocr.process, text, MATH_OCR_API_KEY, MATH_OCR_ENDPOINT)
+            logging.info("Processed math text with MathOCR.")
+            return math_text
+        except Exception as e:
+            logging.error(f"MathOCR processing failed: {e}")
+            return text
+    elif text_type == "Handwrite":
+        processed_text = await process_handwritten_text(text)
+        return processed_text
+    else:
+        # Standard text processing with OCR and LLM corrections
+        corrected_text = await correct_ocr_errors(text)
+        return corrected_text
+
 async def download_models() -> Tuple[List[str], List[Dict[str, str]]]:
-    download_status = []    
+    """
+    Downloads the required models if they are not already present asynchronously.
+
+    Returns:
+        Tuple[List[str], List[Dict[str, str]]]: List of model names and download statuses.
+    """
+    download_status = []
     model_url = "https://huggingface.co/Orenguteng/Llama-3.1-8B-Lexi-Uncensored-GGUF/resolve/main/Llama-3.1-8B-Lexi-Uncensored_Q5_fixedrope.gguf"
     model_name = os.path.basename(model_url)
     base_dir = os.path.join(os.getcwd(), 'data')  # Changed to './data'
     models_dir = os.path.join(base_dir, 'models')
-    
+
     os.makedirs(models_dir, exist_ok=True)
     lock = FileLock(os.path.join(models_dir, "download.lock"))
     status = {"url": model_url, "status": "success", "message": "File already exists."}
     filename = os.path.join(models_dir, model_name)
-    
+
     try:
-        with lock.acquire(timeout=1200):
+        async with asyncio.Lock():
             if not os.path.exists(filename):
                 logging.info(f"Downloading model {model_name} from {model_url}...")
-                urllib.request.urlretrieve(model_url, filename)
-                file_size = os.path.getsize(filename) / (1024 * 1024)
-                if file_size < 100:
-                    os.remove(filename)
-                    status["status"] = "failure"
-                    status["message"] = f"Downloaded file is too small ({file_size:.2f} MB), probably not a valid model file."
-                    logging.error(f"Error: {status['message']}")
-                else:
-                    logging.info(f"Successfully downloaded: {filename} (Size: {file_size:.2f} MB)")
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(model_url) as resp:
+                        if resp.status == 200:
+                            f = await aiofiles.open(filename, mode='wb')
+                            await f.write(await resp.read())
+                            await f.close()
+                            file_size = os.path.getsize(filename) / (1024 * 1024)
+                            if file_size < 100:
+                                os.remove(filename)
+                                status["status"] = "failure"
+                                status["message"] = f"Downloaded file is too small ({file_size:.2f} MB), probably not a valid model file."
+                                logging.error(f"Error: {status['message']}")
+                            else:
+                                logging.info(f"Successfully downloaded: {filename} (Size: {file_size:.2f} MB)")
+                        else:
+                            status["status"] = "failure"
+                            status["message"] = f"Failed to download model. HTTP Status: {resp.status}"
+                            logging.error(f"Error: {status['message']}")
             else:
                 logging.info(f"Model file already exists: {filename}")
     except Timeout:
         logging.error(f"Error: Could not acquire lock for downloading {model_name}")
         status["status"] = "failure"
         status["message"] = "Could not acquire lock for downloading."
-    
+
     download_status.append(status)
     logging.info("Model download process completed.")
     return [model_name], download_status
 
-# Model Loading
 def load_model(llm_model_name: str, raise_exception: bool = True):
+    """
+    Loads the specified LLM model, attempting GPU acceleration first.
+
+    Args:
+        llm_model_name (str): Name of the LLM model to load.
+        raise_exception (bool, optional): Whether to raise exceptions on failure. Defaults to True.
+
+    Returns:
+        Llama or None: Loaded model instance or None if failed.
+    """
     global USE_VERBOSE
     try:
         base_dir = os.path.join(os.getcwd(), 'data')  # Changed to './data'
@@ -150,212 +506,88 @@ def load_model(llm_model_name: str, raise_exception: bool = True):
             raise
         return None
 
-# API Interaction Functions
 async def generate_completion(prompt: str, max_tokens: int = 5000) -> Optional[str]:
+    """
+    Generates text completion using the configured LLM provider.
+
+    Args:
+        prompt (str): The input prompt for text generation.
+        max_tokens (int, optional): Maximum number of tokens to generate. Defaults to 5000.
+
+    Returns:
+        Optional[str]: Generated text or None if failed.
+    """
     if USE_LOCAL_LLM:
-        return await generate_completion_from_local_llm(DEFAULT_LOCAL_MODEL_NAME, prompt, max_tokens)
-    elif API_PROVIDER == "CLAUDE":
-        return await generate_completion_from_claude(prompt, max_tokens)
-    elif API_PROVIDER == "OPENAI":
-        return await generate_completion_from_openai(prompt, max_tokens)
+        if API_PROVIDER.upper() == "OLLAMA":
+            return await generate_completion_from_ollama(prompt, max_tokens)
+        else:
+            return await generate_completion_from_local_llm(DEFAULT_LOCAL_MODEL_NAME, prompt, max_tokens)
     else:
-        logging.error(f"Invalid API_PROVIDER: {API_PROVIDER}")
+        logging.error("Local LLM usage is disabled.")
         return None
 
-def get_tokenizer(model_name: str):
-    if model_name.lower().startswith("gpt-"):
-        return tiktoken.encoding_for_model(model_name)
-    elif model_name.lower().startswith("claude-"):
-        return AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", clean_up_tokenization_spaces=False)
-    elif model_name.lower().startswith("llama-"):
-        return AutoTokenizer.from_pretrained("huggyllama/llama-7b", clean_up_tokenization_spaces=False)
-    else:
-        raise ValueError(f"Unsupported model: {model_name}")
+async def generate_completion_from_ollama(prompt: str, max_tokens: int = 5000) -> Optional[str]:
+    """
+    Generates text completion using Ollama's API asynchronously.
 
-def estimate_tokens(text: str, model_name: str) -> int:
+    Args:
+        prompt (str): The input prompt for text generation.
+        max_tokens (int, optional): Maximum number of tokens to generate. Defaults to 5000.
+
+    Returns:
+        Optional[str]: Generated text or None if failed.
+    """
     try:
-        tokenizer = get_tokenizer(model_name)
-        return len(tokenizer.encode(text))
+        logging.info("Generating completion using Ollama...")
+        process = await asyncio.create_subprocess_exec(
+            "ollama",
+            "prompt",
+            OLLAMA_MODEL_NAME,
+            "--max-tokens",
+            str(max_tokens),
+            "--prompt",
+            prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode == 0:
+            output = stdout.decode().strip()
+            logging.info(f"Ollama response received. Output length: {len(output):,} characters")
+            return output
+        else:
+            logging.error(f"Ollama error: {stderr.decode().strip()}")
+            return None
     except Exception as e:
-        logging.warning(f"Error using tokenizer for {model_name}: {e}. Falling back to approximation.")
-        return approximate_tokens(text)
-
-def approximate_tokens(text: str) -> int:
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text.strip())
-    # Split on whitespace and punctuation, keeping punctuation
-    tokens = re.findall(r'\b\w+\b|\S', text)
-    count = 0
-    for token in tokens:
-        if token.isdigit():
-            count += max(1, len(token) // 2)  # Numbers often tokenize to multiple tokens
-        elif re.match(r'^[A-Z]{2,}$', token):  # Acronyms
-            count += len(token)
-        elif re.search(r'[^\w\s]', token):  # Punctuation and special characters
-            count += 1
-        elif len(token) > 10:  # Long words often split into multiple tokens
-            count += len(token) // 4 + 1
-        else:
-            count += 1
-    # Add a 10% buffer for potential underestimation
-    return int(count * 1.1)
-
-def chunk_text(text: str, max_chunk_tokens: int, model_name: str) -> List[str]:
-    chunks = []
-    tokenizer = get_tokenizer(model_name)
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    current_chunk = []
-    current_chunk_tokens = 0
-    
-    for sentence in sentences:
-        sentence_tokens = len(tokenizer.encode(sentence))
-        if current_chunk_tokens + sentence_tokens > max_chunk_tokens:
-            chunks.append(' '.join(current_chunk))
-            current_chunk = [sentence]
-            current_chunk_tokens = sentence_tokens
-        else:
-            current_chunk.append(sentence)
-            current_chunk_tokens += sentence_tokens
-    
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-    
-    adjusted_chunks = adjust_overlaps(chunks, tokenizer, max_chunk_tokens)
-    return adjusted_chunks
-
-def split_long_sentence(sentence: str, max_tokens: int, model_name: str) -> List[str]:
-    words = sentence.split()
-    chunks = []
-    current_chunk = []
-    current_chunk_tokens = 0
-    tokenizer = get_tokenizer(model_name)
-    
-    for word in words:
-        word_tokens = len(tokenizer.encode(word))
-        if current_chunk_tokens + word_tokens > max_tokens and current_chunk:
-            chunks.append(' '.join(current_chunk))
-            current_chunk = [word]
-            current_chunk_tokens = word_tokens
-        else:
-            current_chunk.append(word)
-            current_chunk_tokens += word_tokens
-    
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-    
-    return chunks
-
-def adjust_overlaps(chunks: List[str], tokenizer, max_chunk_tokens: int, overlap_size: int = 50) -> List[str]:
-    adjusted_chunks = []
-    for i in range(len(chunks)):
-        if i == 0:
-            adjusted_chunks.append(chunks[i])
-        else:
-            overlap_tokens = len(tokenizer.encode(' '.join(chunks[i-1].split()[-overlap_size:])))
-            current_tokens = len(tokenizer.encode(chunks[i]))
-            if overlap_tokens + current_tokens > max_chunk_tokens:
-                overlap_adjusted = chunks[i].split()[:-overlap_size]
-                adjusted_chunks.append(' '.join(overlap_adjusted))
-            else:
-                adjusted_chunks.append(' '.join(chunks[i-1].split()[-overlap_size:] + chunks[i].split()))
-    
-    return adjusted_chunks
-
-async def generate_completion_from_claude(prompt: str, max_tokens: int = CLAUDE_MAX_TOKENS - TOKEN_BUFFER) -> Optional[str]:
-    if not ANTHROPIC_API_KEY:
-        logging.error("Anthropic API key not found. Please set the ANTHROPIC_API_KEY environment variable.")
+        logging.error(f"Error while communicating with Ollama: {e}")
         return None
-    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    prompt_tokens = estimate_tokens(prompt, CLAUDE_MODEL_STRING)
-    adjusted_max_tokens = min(max_tokens, CLAUDE_MAX_TOKENS - prompt_tokens - TOKEN_BUFFER)
-    if adjusted_max_tokens <= 0:
-        logging.warning("Prompt is too long for Claude API. Chunking the input.")
-        chunks = chunk_text(prompt, CLAUDE_MAX_TOKENS - TOKEN_CUSHION, CLAUDE_MODEL_STRING)
-        results = []
-        for chunk in chunks:
-            try:
-                async with client.messages.stream(
-                    model=CLAUDE_MODEL_STRING,
-                    max_tokens=CLAUDE_MAX_TOKENS // 2,
-                    temperature=0.7,
-                    messages=[{"role": "user", "content": chunk}],
-                ) as stream:
-                    message = await stream.get_final_message()
-                    results.append(message.content[0].text)
-                    logging.info(f"Chunk processed. Input tokens: {message.usage.input_tokens:,}, Output tokens: {message.usage.output_tokens:,}")
-            except Exception as e:
-                logging.error(f"An error occurred while processing a chunk: {e}")
-        return " ".join(results)
-    else:
-        try:
-            async with client.messages.stream(
-                model=CLAUDE_MODEL_STRING,
-                max_tokens=adjusted_max_tokens,
-                temperature=0.7,
-                messages=[{"role": "user", "content": prompt}],
-            ) as stream:
-                message = await stream.get_final_message()
-                output_text = message.content[0].text
-                logging.info(f"Total input tokens: {message.usage.input_tokens:,}")
-                logging.info(f"Total output tokens: {message.usage.output_tokens:,}")
-                logging.info(f"Generated output (abbreviated): {output_text[:150]}...")
-                return output_text
-        except Exception as e:
-            logging.error(f"An error occurred while requesting from Claude API: {e}")
-            return None
-
-async def generate_completion_from_openai(prompt: str, max_tokens: int = 5000) -> Optional[str]:
-    if not OPENAI_API_KEY:
-        logging.error("OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
-        return None
-    prompt_tokens = estimate_tokens(prompt, OPENAI_COMPLETION_MODEL)
-    adjusted_max_tokens = min(max_tokens, 4096 - prompt_tokens - TOKEN_BUFFER)  # 4096 is typical max for GPT-3.5 and GPT-4
-    if adjusted_max_tokens <= 0:
-        logging.warning("Prompt is too long for OpenAI API. Chunking the input.")
-        chunks = chunk_text(prompt, OPENAI_MAX_TOKENS - TOKEN_CUSHION, OPENAI_COMPLETION_MODEL) 
-        results = []
-        for chunk in chunks:
-            try:
-                response = await openai_client.chat.completions.create(
-                    model=OPENAI_COMPLETION_MODEL,
-                    messages=[{"role": "user", "content": chunk}],
-                    max_tokens=adjusted_max_tokens,
-                    temperature=0.7,
-                )
-                result = response.choices[0].message.content
-                results.append(result)
-                logging.info(f"Chunk processed. Output tokens: {response.usage.completion_tokens:,}")
-            except Exception as e:
-                logging.error(f"An error occurred while processing a chunk: {e}")
-        return " ".join(results)
-    else:
-        try:
-            response = await openai_client.chat.completions.create(
-                model=OPENAI_COMPLETION_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=adjusted_max_tokens,
-                temperature=0.7,
-            )
-            output_text = response.choices[0].message.content
-            logging.info(f"Total tokens: {response.usage.total_tokens:,}")
-            logging.info(f"Generated output (abbreviated): {output_text[:150]}...")
-            return output_text
-        except Exception as e:
-            logging.error(f"An error occurred while requesting from OpenAI API: {e}")
-            return None
 
 async def generate_completion_from_local_llm(llm_model_name: str, input_prompt: str, number_of_tokens_to_generate: int = 100, temperature: float = 0.7, grammar_file_string: str = None):
+    """
+    Generates text completion using a local LLM asynchronously.
+
+    Args:
+        llm_model_name (str): Name of the LLM model to use.
+        input_prompt (str): The input prompt for text generation.
+        number_of_tokens_to_generate (int, optional): Number of tokens to generate. Defaults to 100.
+        temperature (float, optional): Sampling temperature. Defaults to 0.7.
+        grammar_file_string (str, optional): Grammar file identifier. Defaults to None.
+
+    Returns:
+        dict or str: Generated text and related metadata.
+    """
     logging.info(f"Starting text completion using model: '{llm_model_name}' for input prompt: '{input_prompt}'")
-    llm = load_model(llm_model_name)
+    llm = await asyncio.to_thread(load_model, llm_model_name)
     prompt_tokens = estimate_tokens(input_prompt, llm_model_name)
     adjusted_max_tokens = min(number_of_tokens_to_generate, LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS - prompt_tokens - TOKEN_BUFFER)
     if adjusted_max_tokens <= 0:
         logging.warning("Prompt is too long for LLM. Chunking the input.")
-        chunks = chunk_text(input_prompt, LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS - TOKEN_CUSHION, llm_model_name)
+        chunks = await chunk_text(input_prompt, LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS - TOKEN_CUSHION, llm_model_name)
         results = []
         for chunk in chunks:
             try:
-                output = llm(
+                output = await asyncio.to_thread(
+                    llm,
                     prompt=chunk,
                     max_tokens=LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS - TOKEN_CUSHION,
                     temperature=temperature,
@@ -375,15 +607,17 @@ async def generate_completion_from_local_llm(llm_model_name: str, input_prompt: 
                 raise FileNotFoundError
             grammar_file_path = max(matching_grammar_files, key=os.path.getmtime)
             logging.info(f"Loading selected grammar file: '{grammar_file_path}'")
-            llama_grammar = LlamaGrammar.from_file(grammar_file_path)
-            output = llm(
+            llama_grammar = await asyncio.to_thread(LlamaGrammar.from_file, grammar_file_path)
+            output = await asyncio.to_thread(
+                llm,
                 prompt=input_prompt,
                 max_tokens=adjusted_max_tokens,
                 temperature=temperature,
                 grammar=llama_grammar
             )
         else:
-            output = llm(
+            output = await asyncio.to_thread(
+                llm,
                 prompt=input_prompt,
                 max_tokens=adjusted_max_tokens,
                 temperature=temperature
@@ -397,220 +631,185 @@ async def generate_completion_from_local_llm(llm_model_name: str, input_prompt: 
         return {
             "generated_text": generated_text,
             "finish_reason": finish_reason,
-            "llm_model_usage_json": llm_model_usage_json
+            "usage": llm_model_usage_json
         }
 
-# Image Processing Functions
-def preprocess_image(image):
-    gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
-    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    kernel = np.ones((1, 1), np.uint8)
-    gray = cv2.dilate(gray, kernel, iterations=1)
-    return Image.fromarray(gray)
+async def correct_ocr_errors(text: str) -> str:
+    """
+    Corrects OCR errors in the provided text using LLM.
 
-def convert_pdf_to_images(input_pdf_file_path: str, max_pages: int = 0, skip_first_n_pages: int = 0) -> List[Image.Image]:
-    logging.info(f"Processing PDF file {input_pdf_file_path}")
-    if max_pages == 0:
-        last_page = None
-        logging.info("Converting all pages to images...")
-    else:
-        last_page = skip_first_n_pages + max_pages
-        logging.info(f"Converting pages {skip_first_n_pages + 1} to {last_page}")
-    first_page = skip_first_n_pages + 1  # pdf2image uses 1-based indexing
-    images = convert_from_path(input_pdf_file_path, first_page=first_page, last_page=last_page)
-    logging.info(f"Converted {len(images)} pages from PDF file to images.")
-    return images
+    Args:
+        text (str): The text to correct.
 
-def ocr_image(image):
-    preprocessed_image = preprocess_image(image)
-    return pytesseract.image_to_string(preprocessed_image)
-
-async def process_chunk(chunk: str, prev_context: str, chunk_index: int, total_chunks: int, reformat_as_markdown: bool, suppress_headers_and_page_numbers: bool) -> Tuple[str, str]:
-    logging.info(f"Processing chunk {chunk_index + 1}/{total_chunks} (length: {len(chunk):,} characters)")
-    
-    # Step 1: OCR Correction
-    ocr_correction_prompt = f"""Correct OCR-induced errors in the text, ensuring it flows coherently with the previous context. Follow these guidelines:
-
-1. Fix OCR-induced typos and errors:
-   - Correct words split across line breaks
-   - Fix common OCR errors (e.g., 'rn' misread as 'm')
-   - Use context and common sense to correct errors
-   - Only fix clear errors, don't alter the content unnecessarily
-   - Do not add extra periods or any unnecessary punctuation
-
-2. Maintain original structure:
-   - Keep all headings and subheadings intact
-
-3. Preserve original content:
-   - Keep all important information from the original text
-   - Do not add any new information not present in the original text
-   - Remove unnecessary line breaks within sentences or paragraphs
-   - Maintain paragraph breaks
-   
-4. Maintain coherence:
-   - Ensure the content connects smoothly with the previous context
-   - Handle text that starts or ends mid-sentence appropriately
-
-IMPORTANT: Respond ONLY with the corrected text. Preserve all original formatting, including line breaks. Do not include any introduction, explanation, or metadata.
-
-Previous context:
-{prev_context[-500:]}
-
-Current chunk to process:
-{chunk}
-
-Corrected text:
-"""
-    
-    ocr_corrected_chunk = await generate_completion(ocr_correction_prompt, max_tokens=len(chunk) + 500)
-    
-    processed_chunk = ocr_corrected_chunk
-
-    # Step 2: Markdown Formatting (if requested)
-    if reformat_as_markdown:
-        markdown_prompt = f"""Reformat the following text as markdown, improving readability while preserving the original structure. Follow these guidelines:
-1. Preserve all original headings, converting them to appropriate markdown heading levels (# for main titles, ## for subtitles, etc.)
-   - Ensure each heading is on its own line
-   - Add a blank line before and after each heading
-2. Maintain the original paragraph structure. Remove all breaks within a word that should be a single word (for example, "cor- rect" should be "correct")
-3. Format lists properly (unordered or ordered) if they exist in the original text
-4. Use emphasis (*italic*) and strong emphasis (**bold**) where appropriate, based on the original formatting
-5. Preserve all original content and meaning
-6. Do not add any extra punctuation or modify the existing punctuation
-7. Remove any spuriously inserted introductory text such as "Here is the corrected text:" that may have been added by the LLM and which is obviously not part of the original text.
-8. Remove any obviously duplicated content that appears to have been accidentally included twice. Follow these strict guidelines:
-   - Remove only exact or near-exact repeated paragraphs or sections within the main chunk.
-   - Consider the context (before and after the main chunk) to identify duplicates that span chunk boundaries.
-   - Do not remove content that is simply similar but conveys different information.
-   - Preserve all unique content, even if it seems redundant.
-   - Ensure the text flows smoothly after removal.
-   - Do not add any new content or explanations.
-   - If no obvious duplicates are found, return the main chunk unchanged.
-9. {"Identify but do not remove headers, footers, or page numbers. Instead, format them distinctly, e.g., as blockquotes." if not suppress_headers_and_page_numbers else "Carefully remove headers, footers, and page numbers while preserving all other content."}
-
-Text to reformat:
-
-{ocr_corrected_chunk}
-
-Reformatted markdown:
-"""
-        processed_chunk = await generate_completion(markdown_prompt, max_tokens=len(ocr_corrected_chunk) + 500)
-    new_context = processed_chunk[-1000:]  # Use the last 1000 characters as context for the next chunk
-    logging.info(f"Chunk {chunk_index + 1}/{total_chunks} processed. Output length: {len(processed_chunk):,} characters")
-    return processed_chunk, new_context
-
-async def process_chunks(chunks: List[str], reformat_as_markdown: bool, suppress_headers_and_page_numbers: bool) -> List[str]:
-    total_chunks = len(chunks)
-    async def process_chunk_with_context(chunk: str, prev_context: str, index: int) -> Tuple[int, str, str]:
-        processed_chunk, new_context = await process_chunk(chunk, prev_context, index, total_chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
-        return index, processed_chunk, new_context
-    if USE_LOCAL_LLM:
-        logging.info("Using local LLM. Processing chunks sequentially...")
-        context = ""
-        processed_chunks = []
-        for i, chunk in enumerate(chunks):
-            processed_chunk, context = await process_chunk(chunk, context, i, total_chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
-            processed_chunks.append(processed_chunk)
-    else:
-        logging.info("Using API-based LLM. Processing chunks concurrently while maintaining order...")
-        tasks = [process_chunk_with_context(chunk, "", i) for i, chunk in enumerate(chunks)]
-        results = await asyncio.gather(*tasks)
-        # Sort results by index to maintain order
-        sorted_results = sorted(results, key=lambda x: x[0])
-        processed_chunks = [chunk for _, chunk, _ in sorted_results]
-    logging.info(f"All {total_chunks} chunks processed successfully")
-    return processed_chunks
-
-async def process_document(list_of_extracted_text_strings: List[str], reformat_as_markdown: bool = True, suppress_headers_and_page_numbers: bool = True) -> str:
-    logging.info(f"Starting document processing. Total pages: {len(list_of_extracted_text_strings):,}")
-    full_text = "\n\n".join(list_of_extracted_text_strings)
-    logging.info(f"Size of full text before processing: {len(full_text):,} characters")
-    chunk_size, overlap = 8000, 10
-    # Improved chunking logic
-    paragraphs = re.split(r'\n\s*\n', full_text)
-    chunks = []
-    current_chunk = []
-    current_chunk_length = 0
-    for paragraph in paragraphs:
-        paragraph_length = len(paragraph)
-        if current_chunk_length + paragraph_length <= chunk_size:
-            current_chunk.append(paragraph)
-            current_chunk_length += paragraph_length
-        else:
-            # If adding the whole paragraph exceeds the chunk size,
-            # we need to split the paragraph into sentences
-            if current_chunk:
-                chunks.append("\n\n".join(current_chunk))
-            sentences = re.split(r'(?<=[.!?])\s+', paragraph)
-            current_chunk = []
-            current_chunk_length = 0
-            for sentence in sentences:
-                sentence_length = len(sentence)
-                if current_chunk_length + sentence_length <= chunk_size:
-                    current_chunk.append(sentence)
-                    current_chunk_length += sentence_length
-                else:
-                    if current_chunk:
-                        chunks.append(" ".join(current_chunk))
-                    current_chunk = [sentence]
-                    current_chunk_length = sentence_length
-    # Add any remaining content as the last chunk
-    if current_chunk:
-        chunks.append("\n\n".join(current_chunk) if len(current_chunk) > 1 else current_chunk[0])
-    # Add overlap between chunks
-    for i in range(1, len(chunks)):
-        overlap_text = chunks[i-1].split()[-overlap:]
-        chunks[i] = " ".join(overlap_text) + " " + chunks[i]
-    logging.info(f"Document split into {len(chunks):,} chunks. Chunk size: {chunk_size:,}, Overlap: {overlap:,}")
-    processed_chunks = await process_chunks(chunks, reformat_as_markdown, suppress_headers_and_page_numbers)
-    final_text = "".join(processed_chunks)
-    logging.info(f"Size of text after combining chunks: {len(final_text):,} characters")
-    logging.info(f"Document processing complete. Final text length: {len(final_text):,} characters")
-    return final_text
-
-def remove_corrected_text_header(text):
-    return text.replace("# Corrected text\n", "").replace("# Corrected text:", "").replace("\nCorrected text", "").replace("Corrected text:", "")
-
-async def assess_output_quality(original_text, processed_text):
-    max_chars = 15000  # Limit to avoid exceeding token limits
-    available_chars_per_text = max_chars // 2  # Split equally between original and processed
-
-    original_sample = original_text[:available_chars_per_text]
-    processed_sample = processed_text[:available_chars_per_text]
-    
-    prompt = f"""Compare the following samples of original OCR text with the processed output and assess the quality of the processing. Consider the following factors:
-1. Accuracy of error correction
-2. Improvement in readability
-3. Preservation of original content and meaning
-4. Appropriate use of markdown formatting (if applicable)
-5. Removal of hallucinations or irrelevant content
-
-Original text sample:{original_sample}
-Processed text sample: 
-
-Provide a quality score between 0 and 100, where 100 is perfect processing. Also provide a brief explanation of your assessment.
-
-Your response should be in the following format:
-SCORE: [Your score]
-EXPLANATION: [Your explanation]
-"""
-
-    response = await generate_completion(prompt, max_tokens=1000)
-    
+    Returns:
+        str: Corrected text.
+    """
+    logging.info("Starting OCR error correction using LLM...")
     try:
-        lines = response.strip().split('\n')
-        score_line = next(line for line in lines if line.startswith('SCORE:'))
-        score = int(score_line.split(':')[1].strip())
-        explanation = '\n'.join(line for line in lines if line.startswith('EXPLANATION:')).replace('EXPLANATION:', '').strip()
-        logging.info(f"Quality assessment: Score {score}/100")
-        logging.info(f"Explanation: {explanation}")
-        return score, explanation
+        prompt = f"Correct the following OCR errors in the text:\n\n{text}\n\nCorrected Text:"
+        corrected_text = await generate_completion(prompt, max_tokens=LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS)
+        return corrected_text if corrected_text else text
     except Exception as e:
-        logging.error(f"Error parsing quality assessment response: {e}")
-        logging.error(f"Raw response: {response}")
-        return None, None
-    
+        logging.error(f"Error during OCR error correction: {e}")
+        return text
+
+async def process_math_formulas(text: str) -> str:
+    """
+    Processes math formulas in the text using Math OCR and LLM.
+
+    Args:
+        text (str): The text containing math formulas.
+
+    Returns:
+        str: Text with processed math formulas.
+    """
+    logging.info("Processing math formulas using Math OCR and LLM...")
+    try:
+        formula_pattern = r'\$[^$]+\$'  # Simple regex for LaTeX formulas
+        formulas = re.findall(formula_pattern, text)
+        for formula in formulas:
+            if MATH_OCR_AVAILABLE:
+                processed_formula = await asyncio.to_thread(mathpixocr.process, formula, MATH_OCR_API_KEY, MATH_OCR_ENDPOINT)
+                text = text.replace(formula, processed_formula)
+            else:
+                logging.warning("Math OCR is not available. Skipping formula processing.")
+        return text
+    except Exception as e:
+        logging.error(f"Error during math formula processing: {e}")
+        return text
+
+async def identify_document_structure(text: str) -> str:
+    """
+    Identifies and structures the document layout using LLM.
+
+    Args:
+        text (str): The text to structure.
+
+    Returns:
+        str: Structured text with appropriate formatting.
+    """
+    logging.info("Identifying and structuring document layout using LLM...")
+    try:
+        prompt = f"Analyze the structure of the following text and format it with appropriate headers, lists, and tables using markdown syntax:\n\n{text}\n\nStructured Text:"
+        structured_text = await generate_completion(prompt, max_tokens=LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS)
+        return structured_text if structured_text else text
+    except Exception as e:
+        logging.error(f"Error during document structure identification: {e}")
+        return text
+
+async def generate_completion_async(prompt: str, max_tokens: int = 5000) -> Optional[str]:
+    """
+    Wrapper for generate_completion to ensure it's called asynchronously.
+
+    Args:
+        prompt (str): The input prompt for text generation.
+        max_tokens (int, optional): Maximum number of tokens to generate. Defaults to 5000.
+
+    Returns:
+        Optional[str]: Generated text or None if failed.
+    """
+    return await generate_completion(prompt, max_tokens)
+
+async def process_document(extracted_texts: List[str], reformat_as_markdown: bool, suppress_headers_and_page_numbers: bool) -> str:
+    """
+    Processes the entire document by performing error correction, handwriting recognition,
+    math formula processing, and document structuring.
+
+    Args:
+        extracted_texts (List[str]): List of extracted texts from OCR.
+        reformat_as_markdown (bool): Whether to reformat the text as Markdown.
+        suppress_headers_and_page_numbers (bool): Whether to suppress headers and page numbers.
+
+    Returns:
+        str: The final processed text.
+    """
+    logging.info("Starting document processing with LLM...")
+    try:
+        combined_text = "\n\n".join(extracted_texts)
+        
+        # Error Correction
+        corrected_text = await correct_ocr_errors(combined_text)
+        
+        # Handwriting Recognition
+        handwritten_text = await process_handwritten_text(corrected_text)
+        
+        # Math OCR Processing
+        math_processed_text = await process_math_formulas(handwritten_text)
+        
+        # Document Structure Identification
+        structured_text = await identify_document_structure(math_processed_text)
+        
+        # Reformat as Markdown if required
+        final_text = structured_text  # Placeholder for actual reformatting logic
+        
+        return final_text
+    except Exception as e:
+        logging.error(f"Error during document processing: {e}")
+        return ""
+
+def estimate_tokens(text: str, model_name: str) -> int:
+    """
+    Estimates the number of tokens in the given text based on the model's encoding.
+
+    Args:
+        text (str): The text to estimate tokens for.
+        model_name (str): The name of the model to use for encoding.
+
+    Returns:
+        int: Estimated number of tokens.
+    """
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")  # Example encoding
+        tokens = encoding.encode(text)
+        return len(tokens)
+    except Exception as e:
+        logging.error(f"Error estimating tokens: {e}")
+        return 0
+
+async def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 200, llm_model_name: str = DEFAULT_LOCAL_MODEL_NAME) -> List[str]:
+    """
+    Splits the text into chunks suitable for processing by the LLM.
+
+    Args:
+        text (str): The text to chunk.
+        chunk_size (int, optional): Maximum number of tokens per chunk. Defaults to 2000.
+        overlap (int, optional): Number of overlapping tokens between chunks. Defaults to 200.
+        llm_model_name (str, optional): The LLM model name for token estimation. Defaults to DEFAULT_LOCAL_MODEL_NAME.
+
+    Returns:
+        List[str]: List of text chunks.
+    """
+    logging.info("Starting text chunking...")
+    try:
+        sentences = re.split(r'(?<=[.!?]) +', text)
+        chunks = []
+        current_chunk = []
+        current_chunk_length = 0
+
+        for sentence in sentences:
+            sentence_length = estimate_tokens(sentence, llm_model_name)
+            if current_chunk_length + sentence_length <= chunk_size:
+                current_chunk.append(sentence)
+                current_chunk_length += sentence_length
+            else:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                current_chunk = [sentence]
+                current_chunk_length = sentence_length
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+        logging.info(f"Text chunked into {len(chunks)} parts.")
+        return chunks
+    except Exception as e:
+        logging.error(f"Error during text chunking: {e}")
+        return [text]
+
 async def main():
+    """
+    The main function orchestrating the OCR processing workflow.
+    """
     try:
         # Suppress HTTP request logs
         logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -619,7 +818,7 @@ async def main():
         skip_first_n_pages = 0
         reformat_as_markdown = True
         suppress_headers_and_page_numbers = True
-        
+
         # Download the model if using local LLM
         if USE_LOCAL_LLM:
             _, download_status = await download_models()
@@ -631,31 +830,46 @@ async def main():
 
         base_name = os.path.splitext(os.path.basename(input_pdf_file_path))[0]
         output_extension = '.md' if reformat_as_markdown else '.txt'
-        
+
         data_dir = os.path.join(os.getcwd(), 'data')  # Changed to './data'
         os.makedirs(data_dir, exist_ok=True)
-        
+
         raw_ocr_output_file_path = os.path.join(data_dir, f"{base_name}__raw_ocr_output.txt")
         llm_corrected_output_file_path = os.path.join(data_dir, f"{base_name}_llm_corrected{output_extension}")
 
-        list_of_scanned_images = convert_pdf_to_images(input_pdf_file_path, max_test_pages, skip_first_n_pages)
-        logging.info(f"Tesseract version: {pytesseract.get_tesseract_version()}")
-        logging.info("Extracting text from converted pages...")
-        with ThreadPoolExecutor() as executor:
-            list_of_extracted_text_strings = list(executor.map(ocr_image, list_of_scanned_images))
-        logging.info("Done extracting text from converted pages.")
-        raw_ocr_output = "\n\n".join(list_of_extracted_text_strings)
-        with open(raw_ocr_output_file_path, "w") as f:
-            f.write(raw_ocr_output)
+        list_of_scanned_images = await convert_pdf_to_images(input_pdf_file_path, max_test_pages, skip_first_n_pages)
+
+        extracted_texts = []
+        if PROGRESS_TRACKING_ENABLED:
+            ocr_tasks = [ocr_image(image) for image in list_of_scanned_images]
+            for future in tqdm_asyncio.as_completed(ocr_tasks, desc="Performing OCR on Images"):
+                text, conf = await future
+                if conf < 80.0:  # Threshold for low confidence
+                    corrected_text = await classify_and_process_text(text)
+                    extracted_texts.append(corrected_text)
+                else:
+                    extracted_texts.append(text)
+        else:
+            for image in list_of_scanned_images:
+                text, conf = await ocr_image(image)
+                if conf < 80.0:
+                    corrected_text = await classify_and_process_text(text)
+                    extracted_texts.append(corrected_text)
+                else:
+                    extracted_texts.append(text)
+
+        raw_ocr_output = "\n\n".join(extracted_texts)
+        async with aiofiles.open(raw_ocr_output_file_path, "w") as f:
+            await f.write(raw_ocr_output)
         logging.info(f"Raw OCR output written to: {raw_ocr_output_file_path}")
 
         logging.info("Processing document...")
-        final_text = await process_document(list_of_extracted_text_strings, reformat_as_markdown, suppress_headers_and_page_numbers)            
-        cleaned_text = remove_corrected_text_header(final_text)
-        
+        final_text = await process_document(extracted_texts, reformat_as_markdown, suppress_headers_and_page_numbers)
+        cleaned_text = await asyncio.to_thread(remove_corrected_text_header, final_text)
+
         # Save the LLM corrected output
-        with open(llm_corrected_output_file_path, 'w') as f:
-            f.write(cleaned_text)
+        async with aiofiles.open(llm_corrected_output_file_path, 'w') as f:
+            await f.write(cleaned_text)
         logging.info(f"LLM Corrected text written to: {llm_corrected_output_file_path}") 
 
         if final_text:
@@ -678,6 +892,67 @@ async def main():
     except Exception as e:
         logging.error(f"An error occurred in the main function: {e}")
         logging.error(traceback.format_exc())
-        
+
+def remove_corrected_text_header(text: str) -> str:
+    """
+    Removes headers or page numbers from the corrected text.
+
+    Args:
+        text (str): The text to clean.
+
+    Returns:
+        str: Cleaned text.
+    """
+    # Placeholder for removing headers or page numbers
+    # Implement as needed
+    return text
+
+async def assess_output_quality(raw_text: str, final_text: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Assesses the quality of the output text using LLM.
+
+    Args:
+        raw_text (str): The raw OCR extracted text.
+        final_text (str): The final processed text.
+
+    Returns:
+        Tuple[Optional[int], Optional[str]]: Quality score and explanation.
+    """
+    logging.info("Assessing output quality using LLM...")
+    try:
+        prompt = f"Evaluate the quality of the following text on a scale from 0 to 100 and provide a brief explanation:\n\n{final_text}\n\nQuality Score and Explanation:"
+        assessment = await generate_completion(prompt, max_tokens=100)
+        if assessment:
+            parts = assessment.split(':')
+            if len(parts) >= 2:
+                score_part = parts[0].strip()
+                explanation_part = parts[1].strip()
+                score = int(re.findall(r'\d+', score_part)[0]) if re.findall(r'\d+', score_part) else None
+                explanation = explanation_part
+                return score, explanation
+        return None, None
+    except Exception as e:
+        logging.error(f"Error during quality assessment: {e}")
+        return None, None
+
+async def reformat_as_markdown_function(text: str) -> str:
+    """
+    Reformats the text as Markdown using LLM.
+
+    Args:
+        text (str): The text to reformat.
+
+    Returns:
+        str: Reformatted Markdown text.
+    """
+    logging.info("Reformatting text as Markdown using LLM...")
+    try:
+        prompt = f"Convert the following text into well-structured Markdown format:\n\n{text}\n\nMarkdown Format:"
+        markdown_text = await generate_completion(prompt, max_tokens=LOCAL_LLM_CONTEXT_SIZE_IN_TOKENS)
+        return markdown_text if markdown_text else text
+    except Exception as e:
+        logging.error(f"Error during Markdown reformatting: {e}")
+        return text
+
 if __name__ == '__main__':
     asyncio.run(main())
