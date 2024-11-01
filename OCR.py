@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 import subprocess
 from tqdm.asyncio import tqdm_asyncio
 from tqdm import tqdm
-  
+
 # Added Math OCR dependency
 try:
     import mathpixocr  # Replace with the actual Math OCR library you are using
@@ -211,7 +211,7 @@ def classify_text_type(text: str) -> str:
         return "Handwrite"
     else:
         return "Text"
-
+    
 def pytesseract_ocr(image: Image.Image) -> Tuple[str, float]:
     """
     Performs OCR using pytesseract on the given image.
@@ -955,4 +955,5 @@ async def reformat_as_markdown_function(text: str) -> str:
         return text
 
 if __name__ == '__main__':
+    # Run
     asyncio.run(main())
