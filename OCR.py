@@ -23,8 +23,7 @@ from transformers import AutoTokenizer
 import subprocess
 from tqdm.asyncio import tqdm_asyncio
 from tqdm import tqdm
-
-
+  
 # Added Math OCR dependency
 try:
     import mathpixocr  # Replace with the actual Math OCR library you are using
