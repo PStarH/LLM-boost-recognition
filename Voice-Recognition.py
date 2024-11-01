@@ -927,7 +927,6 @@ async def main():
         logging.info(f" Validated Words: {validated_output_file_path}")
         logging.info(f" LLM Refined Transcription: {refined_sr_output_file_path}")
         logging.info(f" Identified Intent: {intent_output_file_path}")
-
         # Perform a final quality check
         quality_score, explanation = await assess_output_quality(text, refined_text)
         if quality_score is not None:
@@ -935,7 +934,6 @@ async def main():
             logging.info(f"Explanation: {explanation}")
         else:
             logging.warning("Unable to determine final quality score.")
-
         # Adaptive Learning: Save feedback for future improvements
         feedback = {
             "original_text": text,
@@ -948,8 +946,6 @@ async def main():
         async with aiofiles.open(feedback_file_path, "w") as f:
             await f.write(json.dumps(feedback, ensure_ascii=False, indent=4))
         logging.info(f"Feedback saved to: {feedback_file_path}")
-
-
         # After processing the audio and getting the transcription
         # Collect user feedback (this is just a placeholder for actual user input)
         original_text = text  # The original transcription
