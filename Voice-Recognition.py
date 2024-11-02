@@ -1,36 +1,83 @@
-import os
-import glob
-import traceback
 import asyncio
 import json
-import re
-import aiohttp
-import aiofiles
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import os
+import re
+import traceback
 import warnings
-from typing import List, Dict, Tuple, Optional
-from decouple import config
-import speech_recognition as sr  # For speech recognition
-# import whisper  # For Whisper model
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional, Tuple
+
+import aiofiles
+import aiohttp
+import fasttext
 import librosa
 import numpy as np
-import soundfile as sf
-from filelock import FileLock, Timeout
-from transformers import AutoTokenizer, pipeline
-import subprocess
-from tqdm.asyncio import tqdm_asyncio
-from tqdm import tqdm
-import webrtcvad
-from pydub import AudioSegment
-from langdetect import detect
-from spellchecker import SpellChecker
-import torch
-import torchaudio
-from pyannote.audio import Pipeline as PyannotePipeline
-import fasttext
 import rnn_noise_suppression  # Hypothetical advanced noise suppression library
+import soundfile as sf
+import speech_recognition as sr  # For speech recognition
+import torchaudio
+import torch
+import webrtcvad
+from decouple import config
+from filelock import FileLock, Timeout
+from langdetect import detect
+from pydub import AudioSegment
+from spellchecker import SpellChecker
+from transformers import AutoTokenizer, pipeline
+from tqdm import tqdm
+from tqdm.asyncio import tqdm_asyncio
+
 from deep_speech import Model as DeepSpeechModel  # Hypothetical DeepSpeech integration
+from pyannote.audio import Pipeline as PyannotePipeline
+
+# Configuration Dataclass
+from dataclasses import dataclass
+
+
+@dataclass
+class Config:
+    USE_LOCAL_LLM: bool = config('USE_LOCAL_LLM', default=True, cast=bool)
+    API_PROVIDER: str = config('API_PROVIDER', default="OPENAI", cast=str)  # OPENAI or LOCAL
+    OPENAI_API_KEY: str = config('OPENAI_API_KEY', default="", cast=str)
+    AUDIO_FORMAT: str = config('AUDIO_FORMAT', default="wav", cast=str)  # e.g., 'wav', 'mp3'
+    AUDIO_SAMPLE_RATE: int = config('AUDIO_SAMPLE_RATE', default=16000, cast=int)
+    AUDIO_CHANNELS: int = config('AUDIO_CHANNELS', default=1, cast=int)
+    SUPPORTED_LANGUAGES: List[str] = config(
+        "SUPPORTED_LANGUAGES",
+        default="en,es,fr,de,it,zh,ja,ko,ru,ar,hi,pt,sv,nl,da,fi,no,pl,tr,vi",
+        cast=lambda v: [lang.strip() for lang in v.split(",")],
+    )
+    CUSTOM_VOCABULARY: List[str] = config(
+        "CUSTOM_VOCABULARY",
+        default="",
+        cast=lambda v: [word.strip() for word in v.split(",")],
+    )
+    CUSTOM_PRONUNCIATIONS: Dict[str, str] = config(
+        "CUSTOM_PRONUNCIATIONS",
+        default="",
+        cast=lambda v: {
+            word.strip(): pronunciation.strip()
+            for word, pronunciation in (item.split(":") for item in v.split(",") if ":" in item)
+        },
+    )
+    VAD_AGGRESSIVENESS: int = config('VAD_AGGRESSIVENESS', default=3, cast=int)
+    FRAME_DURATION_MS: int = config('FRAME_DURATION_MS', default=30, cast=int)
+    FASTTEXT_MODEL_PATH: str = config('FASTTEXT_MODEL_PATH', default='lid.176.bin')
+
+
+# Initialize Configuration
+cfg = Config()
+
+# Logging Configuration
+warnings.filterwarnings("ignore", category=FutureWarning)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s"
+)
+
+# ThreadPoolExecutor for blocking operations
+executor = ThreadPoolExecutor(max_workers=4)
 
 # Configuration for advanced noise suppression
 try:
@@ -50,62 +97,18 @@ except Exception:
 
 # Configuration for fastText language detection
 try:
-    language_model = fasttext.load_model(config('FASTTEXT_MODEL_PATH', default='lid.176.bin'))
+    language_model = fasttext.load_model(cfg.FASTTEXT_MODEL_PATH)
     FASTTEXT_AVAILABLE = True
 except Exception:
     FASTTEXT_AVAILABLE = False
     logging.warning("FastText language detection model not found. Falling back to langdetect.")
 
 # Configuration for model ensembles
-# WHISPER_AVAILABLE = whisper.__version__ is not None  # Removed whisper check
 SPEECH_RECOGNITION_AVAILABLE = True if 'sr' in globals() else False
 DEEPSPEECH_AVAILABLE = False  # Will be initialized later based on availability
 
-WHOLE_SPEECH_RECOGNITION_AVAILABLE = False or SPEECH_RECOGNITION_AVAILABLE or DEEPSPEECH_AVAILABLE
+WHOLE_SPEECH_RECOGNITION_AVAILABLE = SPEECH_RECOGNITION_AVAILABLE or DEEPSPEECH_AVAILABLE
 
-# Configuration
-USE_LOCAL_LLM = config('USE_LOCAL_LLM', default=True, cast=bool)
-API_PROVIDER = config('API_PROVIDER', default="OPENAI", cast=str)  # OPENAI or LOCAL
-OPENAI_API_KEY = config('OPENAI_API_KEY', default="", cast=str)
-# WHISPER_MODEL_NAME = config('WHISPER_MODEL_NAME', default="base", cast=str)  # Removed whisper model config
-
-# Configuration for audio processing
-AUDIO_FORMAT = config('AUDIO_FORMAT', default="wav", cast=str)  # e.g., 'wav', 'mp3'
-AUDIO_SAMPLE_RATE = config('AUDIO_SAMPLE_RATE', default=16000, cast=int)
-AUDIO_CHANNELS = config('AUDIO_CHANNELS', default=1, cast=int)
-
-# Supported languages configuration
-SUPPORTED_LANGUAGES = config(
-    "SUPPORTED_LANGUAGES",
-    default="en,es,fr,de,it,zh,ja,ko,ru,ar,hi,pt,sv,nl,da,fi,no,pl,tr,vi",
-    cast=lambda v: [lang.strip() for lang in v.split(",")],
-)
-
-# Custom vocabulary for SpeechRecognition
-CUSTOM_VOCABULARY = config(
-    "CUSTOM_VOCABULARY",
-    default="",
-    cast=lambda v: [word.strip() for word in v.split(",")],
-)
-
-# Custom pronunciation dictionary
-CUSTOM_PRONUNCIATIONS = config(
-    "CUSTOM_PRONUNCIATIONS",
-    default="",
-    cast=lambda v: {
-        word.strip(): pronunciation.strip()
-        for word, pronunciation in (item.split(":") for item in v.split(",") if ":" in item)
-    },
-)
-
-warnings.filterwarnings("ignore", category=FutureWarning)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s"
-)
-
-# ThreadPoolExecutor for blocking operations
-executor = ThreadPoolExecutor(max_workers=4)
 
 async def preprocess_audio(audio_path: str, processed_audio_path: str) -> None:
     """
@@ -120,19 +123,19 @@ async def preprocess_audio(audio_path: str, processed_audio_path: str) -> None:
         logging.info("Loading and converting audio file...")
         # Load audio and convert to desired format using pydub for better handling
         audio = await asyncio.to_thread(AudioSegment.from_file, audio_path)
-        audio = audio.set_frame_rate(AUDIO_SAMPLE_RATE).set_channels(AUDIO_CHANNELS)
+        audio = audio.set_frame_rate(cfg.AUDIO_SAMPLE_RATE).set_channels(cfg.AUDIO_CHANNELS)
         await asyncio.to_thread(audio.export, processed_audio_path, format="wav")
 
         # Advanced noise suppression using RNNoise if available
         if RNNOISE_AVAILABLE:
             logging.info("Applying neural noise suppression with RNNoise...")
             denoised_audio = await asyncio.to_thread(rnn_noise_suppression.reduce_noise, processed_audio_path)
-            await asyncio.to_thread(sf.write, processed_audio_path, denoised_audio, AUDIO_SAMPLE_RATE)
+            await asyncio.to_thread(sf.write, processed_audio_path, denoised_audio, cfg.AUDIO_SAMPLE_RATE)
             logging.info("Neural noise suppression completed.")
         else:
             # Perform spectral gating noise reduction as a fallback
             logging.info("Applying spectral gating for noise reduction...")
-            y, sr = await asyncio.to_thread(librosa.load, processed_audio_path, sr=AUDIO_SAMPLE_RATE)
+            y, sr = await asyncio.to_thread(librosa.load, processed_audio_path, sr=cfg.AUDIO_SAMPLE_RATE)
             reduced_noise = spectral_gate(y, sr)
             # Normalize audio
             logging.info("Normalizing audio...")
@@ -145,7 +148,7 @@ async def preprocess_audio(audio_path: str, processed_audio_path: str) -> None:
             logging.info("Applying advanced Voice Activity Detection (VAD) using pyannote.audio...")
             vad_segments = await asyncio.to_thread(pyannote_pipeline, {"audio": processed_audio_path})
             trimmed_audio = extract_segments(processed_audio_path, vad_segments)
-            await asyncio.to_thread(sf.write, processed_audio_path, trimmed_audio, AUDIO_SAMPLE_RATE)
+            await asyncio.to_thread(sf.write, processed_audio_path, trimmed_audio, cfg.AUDIO_SAMPLE_RATE)
             logging.info("Advanced VAD processing completed.")
         else:
             # Fallback to basic VAD
@@ -157,17 +160,19 @@ async def preprocess_audio(audio_path: str, processed_audio_path: str) -> None:
     except Exception as e:
         logging.error(f"Error during audio preprocessing: {e}")
 
-def spectral_gate(audio, sr, prop_decrease=1.0, n_fft=2048, hop_length=512, win_length=2048):
+
+def spectral_gate(audio: np.ndarray, sr: int, prop_decrease: float = 1.0, n_fft: int = 2048,
+                 hop_length: int = 512, win_length: int = 2048) -> np.ndarray:
     """
     Applies spectral gating for noise reduction using librosa.
 
     Args:
         audio (np.ndarray): Audio signal.
         sr (int): Sample rate.
-        prop_decrease (float): Proportion to decrease noise components.
-        n_fft (int): Number of FFT components.
-        hop_length (int): Number of samples between successive frames.
-        win_length (int): Each frame of audio is windowed by window of length win_length.
+        prop_decrease (float, optional): Proportion to decrease noise components. Defaults to 1.0.
+        n_fft (int, optional): Number of FFT components. Defaults to 2048.
+        hop_length (int, optional): Number of samples between successive frames. Defaults to 512.
+        win_length (int, optional): Each frame of audio is windowed by window of length win_length. Defaults to 2048.
 
     Returns:
         np.ndarray: Denoised audio signal.
@@ -188,6 +193,7 @@ def spectral_gate(audio, sr, prop_decrease=1.0, n_fft=2048, hop_length=512, win_
         logging.error(f"Spectral gating error: {e}")
         return audio
 
+
 def extract_segments(audio_path: str, segments) -> np.ndarray:
     """
     Extracts voiced segments from the audio based on VAD results.
@@ -200,7 +206,7 @@ def extract_segments(audio_path: str, segments) -> np.ndarray:
         np.ndarray: Trimmed audio data.
     """
     try:
-        audio, sr = librosa.load(audio_path, sr=AUDIO_SAMPLE_RATE)
+        audio, sr = librosa.load(audio_path, sr=cfg.AUDIO_SAMPLE_RATE)
         trimmed_audio = np.array([])
         for segment in segments.get_timeline():
             start_sample = int(segment.start * sr)
@@ -209,8 +215,9 @@ def extract_segments(audio_path: str, segments) -> np.ndarray:
         return trimmed_audio
     except Exception as e:
         logging.error(f"Error extracting segments: {e}")
-        audio, sr = librosa.load(audio_path, sr=AUDIO_SAMPLE_RATE)
+        audio, sr = librosa.load(audio_path, sr=cfg.AUDIO_SAMPLE_RATE)
         return audio
+
 
 def apply_vad(audio_path: str) -> Tuple[np.ndarray, int]:
     """
@@ -223,10 +230,10 @@ def apply_vad(audio_path: str) -> Tuple[np.ndarray, int]:
         Tuple[np.ndarray, int]: Trimmed audio data and sample rate.
     """
     try:
-        vad = webrtcvad.Vad(int(config('VAD_AGGRESSIVENESS', default=3)))
-        audio, sample_rate = librosa.load(audio_path, sr=AUDIO_SAMPLE_RATE)
+        vad = webrtcvad.Vad(cfg.VAD_AGGRESSIVENESS)
+        audio, sample_rate = librosa.load(audio_path, sr=cfg.AUDIO_SAMPLE_RATE)
         audio_bytes = (audio * 32768).astype(np.int16).tobytes()
-        frame_duration = int(config('FRAME_DURATION_MS', default=30))  # ms
+        frame_duration = cfg.FRAME_DURATION_MS  # ms
         frames = frame_generator(frame_duration, audio, sample_rate)
         frames = list(frames)
         segments = vad_collector(sample_rate, frame_duration, 300, vad, frames)
@@ -237,8 +244,9 @@ def apply_vad(audio_path: str) -> Tuple[np.ndarray, int]:
         return trimmed_np, sample_rate
     except Exception as e:
         logging.error(f"VAD error: {e}")
-        audio, sample_rate = librosa.load(audio_path, sr=AUDIO_SAMPLE_RATE)
+        audio, sample_rate = librosa.load(audio_path, sr=cfg.AUDIO_SAMPLE_RATE)
         return audio, sample_rate
+
 
 def frame_generator(frame_duration_ms: int, audio: np.ndarray, sample_rate: int):
     """
@@ -263,6 +271,7 @@ def frame_generator(frame_duration_ms: int, audio: np.ndarray, sample_rate: int)
             duration=frame_duration_ms / 1000.0,
         )
 
+
 class Frame:
     """
     Represents a frame of audio data.
@@ -272,6 +281,7 @@ class Frame:
         self.bytes = bytes
         self.timestamp = timestamp
         self.duration = duration
+
 
 def vad_collector(
     sample_rate: int,
@@ -324,6 +334,7 @@ def vad_collector(
                 triggered = False
                 ring_buffer = []
 
+
 async def validate_words_with_llm(
     text: str, language: Optional[str] = "en"
 ) -> List[Tuple[str, bool]]:
@@ -343,7 +354,7 @@ async def validate_words_with_llm(
         spell = SpellChecker(language=language)
         words = text.split()
         for word in words:
-            if word in CUSTOM_VOCABULARY:
+            if word in cfg.CUSTOM_VOCABULARY:
                 # Skip validation for custom vocabulary as they are expected to be correct
                 validated_words.append((word, True))
                 continue
@@ -356,6 +367,7 @@ async def validate_words_with_llm(
     except Exception as e:
         logging.error(f"Error during word validation with LLM: {e}")
     return validated_words
+
 
 async def refine_transcription_contextually(
     text: str, language: Optional[str] = "en"
@@ -373,7 +385,7 @@ async def refine_transcription_contextually(
     logging.info("Refining transcription contextually using LLM...")
     try:
         prompt = (
-            f"Improve the accuracy and coherence of the following transcription without altering the original words unnecessarily:\n\n"
+            "Improve the accuracy and coherence of the following transcription without altering the original words unnecessarily:\n\n"
             f"{text}\n\nRefined Transcription:"
         )
         refined_text = await generate_completion(
@@ -399,6 +411,7 @@ async def refine_transcription_contextually(
         logging.error(f"Error during contextual transcription refinement with LLM: {e}")
         return text
 
+
 async def transcribe_with_multiple_engines(
     processed_audio_path: str, language: str
 ) -> Tuple[str, float]:
@@ -423,7 +436,7 @@ async def transcribe_with_multiple_engines(
                 audio = recognizer.record(source)
 
             # Apply custom vocabulary if any
-            if CUSTOM_VOCABULARY:
+            if cfg.CUSTOM_VOCABULARY:
                 logging.info("Applying custom vocabulary to SpeechRecognition engine.")
                 # Placeholder for dynamic vocabulary injection if supported
                 # SpeechRecognition with Google API does not support custom vocabularies directly
@@ -466,6 +479,7 @@ async def transcribe_with_multiple_engines(
     )
     return best_transcription, best_confidence
 
+
 async def convert_audio_to_text(audio_path: str) -> Tuple[str, float, Optional[str], List[Tuple[str, bool]]]:
     """
     Converts an audio file to text using multiple voice recognition engines, detects language,
@@ -486,14 +500,11 @@ async def convert_audio_to_text(audio_path: str) -> Tuple[str, float, Optional[s
 
         detected_language = None
 
-        if (
-            SPEECH_RECOGNITION_AVAILABLE
-            or DEEPSPEECH_AVAILABLE
-        ):
+        if WHOLE_SPEECH_RECOGNITION_AVAILABLE:
             # Detect language using fastText if available
             if FASTTEXT_AVAILABLE:
                 logging.info("Detecting language using fastText.")
-                audio, sr = await asyncio.to_thread(librosa.load, processed_audio_path, sr=AUDIO_SAMPLE_RATE)
+                audio, sr = await asyncio.to_thread(librosa.load, processed_audio_path, sr=cfg.AUDIO_SAMPLE_RATE)
                 text, conf = await transcribe_with_multiple_engines(
                     processed_audio_path, "en"
                 )  # Temporary language
@@ -501,9 +512,9 @@ async def convert_audio_to_text(audio_path: str) -> Tuple[str, float, Optional[s
                 detected_language = prediction[0][0].replace("__label__", "")
                 logging.info(f"Detected language: {detected_language}")
             else:
-                # Fallback to langdetect if fastText and Whisper are not available
+                # Fallback to langdetect if fastText is not available
                 logging.info("Using langdetect for language detection.")
-                audio, sr = await asyncio.to_thread(librosa.load, processed_audio_path, sr=AUDIO_SAMPLE_RATE)
+                audio, sr = await asyncio.to_thread(librosa.load, processed_audio_path, sr=cfg.AUDIO_SAMPLE_RATE)
                 text, conf = await transcribe_with_multiple_engines(
                     processed_audio_path, "en"
                 )
@@ -511,7 +522,7 @@ async def convert_audio_to_text(audio_path: str) -> Tuple[str, float, Optional[s
                 logging.info(f"Detected language using langdetect: {detected_language}")
 
             # Check if detected language is supported
-            if detected_language not in SUPPORTED_LANGUAGES:
+            if detected_language not in cfg.SUPPORTED_LANGUAGES:
                 logging.warning(
                     f"Detected language '{detected_language}' is not in the supported languages list. Defaulting to English."
                 )
@@ -541,6 +552,7 @@ async def convert_audio_to_text(audio_path: str) -> Tuple[str, float, Optional[s
         logging.error(f"Failed to convert audio to text: {e}")
         return "", 0.0, None, []
 
+
 async def process_command_text(
     text: str, language: Optional[str] = "en"
 ) -> str:
@@ -561,6 +573,7 @@ async def process_command_text(
     except Exception as e:
         logging.error(f"Error processing command text: {e}")
         return text
+
 
 async def correct_speech_errors(
     text: str, language: Optional[str] = "en"
@@ -586,6 +599,7 @@ async def correct_speech_errors(
         logging.error(f"Error during speech error correction: {e}")
         return text
 
+
 async def identify_speech_intent(
     text: str, language: Optional[str] = "en"
 ) -> str:
@@ -608,6 +622,7 @@ async def identify_speech_intent(
         logging.error(f"Error during intent identification: {e}")
         return "Unknown"
 
+
 async def generate_completion(prompt: str, max_tokens: int = 500) -> Optional[str]:
     """
     Generates text completion using the configured LLM provider.
@@ -619,8 +634,8 @@ async def generate_completion(prompt: str, max_tokens: int = 500) -> Optional[st
     Returns:
         Optional[str]: Generated text or None if failed.
     """
-    if USE_LOCAL_LLM:
-        if API_PROVIDER.upper() == "OLLAMA":
+    if cfg.USE_LOCAL_LLM:
+        if cfg.API_PROVIDER.upper() == "OLLAMA":
             return await generate_completion_from_ollama(prompt, max_tokens)
         else:
             return await generate_completion_from_local_llm(
@@ -629,6 +644,7 @@ async def generate_completion(prompt: str, max_tokens: int = 500) -> Optional[st
     else:
         logging.error("Local LLM usage is disabled.")
         return None
+
 
 async def generate_completion_from_ollama(
     prompt: str, max_tokens: int = 500
@@ -670,6 +686,7 @@ async def generate_completion_from_ollama(
     except Exception as e:
         logging.error(f"Error while communicating with Ollama: {e}")
         return None
+
 
 async def generate_completion_from_local_llm(
     llm_model_name: str,
@@ -735,6 +752,7 @@ async def generate_completion_from_local_llm(
         )
         return generated_text
 
+
 def load_model(llm_model_name: str, raise_exception: bool = True):
     """
     Loads the specified LLM model.
@@ -756,6 +774,7 @@ def load_model(llm_model_name: str, raise_exception: bool = True):
             raise
         return None
 
+
 def estimate_tokens(text: str, model_name: str) -> int:
     """
     Estimates the number of tokens in the given text based on the model's encoding.
@@ -774,6 +793,7 @@ def estimate_tokens(text: str, model_name: str) -> int:
     except Exception as e:
         logging.error(f"Error estimating tokens: {e}")
         return 0
+
 
 async def chunk_text(
     text: str,
@@ -820,6 +840,7 @@ async def chunk_text(
         logging.error(f"Error during text chunking: {e}")
         return [text]
 
+
 async def collect_user_feedback(original_text: str, corrected_text: str) -> None:
     """
     Collects user feedback on the transcription accuracy.
@@ -838,6 +859,7 @@ async def collect_user_feedback(original_text: str, corrected_text: str) -> None
         await f.write(json.dumps(feedback, ensure_ascii=False, indent=4) + "\n")
     logging.info(f"User feedback saved to: {feedback_file_path}")
 
+
 async def main():
     """
     The main function orchestrating the voice recognition workflow.
@@ -848,10 +870,10 @@ async def main():
         reformat_as_markdown = config('REFORMAT_AS_MARKDOWN', default=True, cast=bool)
 
         # Load models if using local LLM
-        if USE_LOCAL_LLM:
+        if cfg.USE_LOCAL_LLM:
             logging.info(f"Using Local LLM with Model: {DEFAULT_LOCAL_MODEL_NAME}")
         else:
-            logging.info(f"Using API for completions: {API_PROVIDER}")
+            logging.info(f"Using API for completions: {cfg.API_PROVIDER}")
 
         base_name = os.path.splitext(os.path.basename(input_audio_file_path))[0]
         output_extension = ".md" if reformat_as_markdown else ".txt"
@@ -927,6 +949,7 @@ async def main():
         logging.info(f" Validated Words: {validated_output_file_path}")
         logging.info(f" LLM Refined Transcription: {refined_sr_output_file_path}")
         logging.info(f" Identified Intent: {intent_output_file_path}")
+
         # Perform a final quality check
         quality_score, explanation = await assess_output_quality(text, refined_text)
         if quality_score is not None:
@@ -934,6 +957,7 @@ async def main():
             logging.info(f"Explanation: {explanation}")
         else:
             logging.warning("Unable to determine final quality score.")
+
         # Adaptive Learning: Save feedback for future improvements
         feedback = {
             "original_text": text,
@@ -946,6 +970,7 @@ async def main():
         async with aiofiles.open(feedback_file_path, "w") as f:
             await f.write(json.dumps(feedback, ensure_ascii=False, indent=4))
         logging.info(f"Feedback saved to: {feedback_file_path}")
+
         # After processing the audio and getting the transcription
         # Collect user feedback (this is just a placeholder for actual user input)
         original_text = text  # The original transcription
@@ -955,6 +980,7 @@ async def main():
     except Exception as e:
         logging.error(f"An error occurred in the main function: {e}")
         logging.error(traceback.format_exc())
+
 
 def remove_corrected_text_header(text: str) -> str:
     """
@@ -969,6 +995,7 @@ def remove_corrected_text_header(text: str) -> str:
     # Implemented functionality to remove potential headers or irrelevant information
     cleaned_text = re.sub(r"Refined Transcription:\s*", "", text)
     return cleaned_text
+
 
 async def assess_output_quality(
     raw_text: str, final_text: str
@@ -986,7 +1013,7 @@ async def assess_output_quality(
     logging.info("Assessing output quality using LLM...")
     try:
         prompt = (
-            f"Evaluate the quality of the following text on a scale from 0 to 100 and provide a brief explanation:\n\n"
+            "Evaluate the quality of the following text on a scale from 0 to 100 and provide a brief explanation:\n\n"
             f"{final_text}\n\nQuality Score and Explanation:"
         )
         assessment = await generate_completion(prompt, max_tokens=100)
@@ -1007,6 +1034,7 @@ async def assess_output_quality(
     except Exception as e:
         logging.error(f"Error during quality assessment: {e}")
         return None, None
+
 
 # Initialize DeepSpeech model if available
 if not DEEPSPEECH_AVAILABLE:
