@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import shlex
 import traceback
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +32,9 @@ from tqdm.asyncio import tqdm_asyncio
 
 from deep_speech import Model as DeepSpeechModel  # Hypothetical DeepSpeech integration
 from pyannote.audio import Pipeline as PyannotePipeline
+
+# Added import for Whisper
+import openai
 
 # Configuration Dataclass
 from dataclasses import dataclass
@@ -64,6 +69,10 @@ class Config:
     VAD_AGGRESSIVENESS: int = config('VAD_AGGRESSIVENESS', default=3, cast=int)
     FRAME_DURATION_MS: int = config('FRAME_DURATION_MS', default=30, cast=int)
     FASTTEXT_MODEL_PATH: str = config('FASTTEXT_MODEL_PATH', default='lid.176.bin')
+    
+    # Whisper Configuration
+    ENABLE_WHISPER: bool = config('ENABLE_WHISPER', default=True, cast=bool)
+    WHISPER_MODEL: str = config('WHISPER_MODEL', default="base", cast=str)  # e.g., 'base', 'small', 'medium', 'large'
 
 
 # Initialize Configuration
@@ -107,7 +116,20 @@ except Exception:
 SPEECH_RECOGNITION_AVAILABLE = True if 'sr' in globals() else False
 DEEPSPEECH_AVAILABLE = False  # Will be initialized later based on availability
 
-WHOLE_SPEECH_RECOGNITION_AVAILABLE = SPEECH_RECOGNITION_AVAILABLE or DEEPSPEECH_AVAILABLE
+# Added Whisper availability
+WHISPER_AVAILABLE = False
+if cfg.ENABLE_WHISPER:
+    try:
+        openai.api_key = cfg.OPENAI_API_KEY
+        # Optionally, verify if Whisper can be accessed
+        WHISPER_AVAILABLE = True
+        logging.info("Whisper ASR is enabled and available.")
+    except Exception as e:
+        WHISPER_AVAILABLE = False
+        logging.error(f"Whisper ASR could not be initialized: {e}")
+        logging.warning("Whisper ASR will be unavailable.")
+
+WHOLE_SPEECH_RECOGNITION_AVAILABLE = SPEECH_RECOGNITION_AVAILABLE or DEEPSPEECH_AVAILABLE or WHISPER_AVAILABLE
 
 
 async def preprocess_audio(audio_path: str, processed_audio_path: str) -> None:
@@ -465,6 +487,18 @@ async def transcribe_with_multiple_engines(
         except Exception as e:
             logging.error(f"DeepSpeech transcription error: {e}")
 
+    # Added Whisper transcription
+    if WHISPER_AVAILABLE:
+        try:
+            logging.info("Transcribing with Whisper engine.")
+            transcription = await transcribe_with_whisper(processed_audio_path, language)
+            if transcription:
+                confidences.append(93.0)  # Hypothetical confidence score
+                transcriptions.append(transcription)
+                logging.info("Whisper transcription completed.")
+        except Exception as e:
+            logging.error(f"Whisper transcription error: {e}")
+
     if not transcriptions:
         logging.error("No transcriptions available from ASR engines.")
         return "", 0.0
@@ -478,6 +512,34 @@ async def transcribe_with_multiple_engines(
         "Multiple ASR engines transcribed the audio. Selected the best transcription based on confidence."
     )
     return best_transcription, best_confidence
+
+
+async def transcribe_with_whisper(audio_path: str, language: str) -> Optional[str]:
+    """
+    Transcribes audio using OpenAI's Whisper ASR.
+
+    Args:
+        audio_path (str): Path to the processed audio file.
+        language (str): Language of the audio.
+
+    Returns:
+        Optional[str]: Transcribed text or None if failed.
+    """
+    try:
+        logging.info("Starting transcription with Whisper ASR...")
+        with open(audio_path, "rb") as audio_file:
+            response = await asyncio.to_thread(
+                openai.Audio.transcribe,
+                model=cfg.WHISPER_MODEL,
+                file=audio_file,
+                language=language
+            )
+        transcription = response.get("text", "").strip()
+        logging.info("Whisper ASR transcription successful.")
+        return transcription
+    except Exception as e:
+        logging.error(f"Error during Whisper transcription: {e}")
+        return None
 
 
 async def convert_audio_to_text(audio_path: str) -> Tuple[str, float, Optional[str], List[Tuple[str, bool]]]:
