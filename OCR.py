@@ -212,16 +212,22 @@ def classify_text_type(text: str) -> str:
         text (str): The text to classify.
 
     Returns:
-        str: The classified text type ('Math', 'Handwrite', 'LaTeX', or 'Text').
+        str: The classified text type ('Math', 'Handwrite', 'LaTeX', 'Table', 'Figure', or 'Text').
     """
     math_pattern = r'[\$\\](.*?)[\$\\]'  # Detect LaTeX math
     latex_pattern = r'\\[a-zA-Z]+\{.*?\}'  # Detect LaTeX commands
     handwriting_pattern = r'[A-Za-z]{1,}\b'  # Placeholder for handwriting detection
+    table_pattern = r'(?:\|.*\|)'  # Detect simple table patterns
+    figure_pattern = r'(Figure\s+\d+)|(Fig\.\s+\d+)'  # Detect figure references
 
     if re.search(latex_pattern, text):
         return "LaTeX"
     elif re.search(math_pattern, text):
         return "Math"
+    elif re.search(table_pattern, text):
+        return "Table"
+    elif re.search(figure_pattern, text):
+        return "Figure"
     elif re.search(handwriting_pattern, text):
         return "Handwrite"
     else:
@@ -315,9 +321,86 @@ def latex_ocr(image: Image.Image) -> Tuple[str, float]:
         logging.error(f"LaTeX OCR failed: {e}")
         return "", 0.0
 
+def math_ocr(image: Image.Image) -> Tuple[str, float]:
+    """
+    Performs Math OCR using MathPixOCR on the given image.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Extracted math text and confidence score.
+    """
+    if not MATH_OCR_AVAILABLE:
+        logging.warning("Math OCR is not available.")
+        return "", 0.0
+    try:
+        # Assuming mathpixocr.process returns the math text
+        math_text = mathpixocr.process(image, MATH_OCR_API_KEY, MATH_OCR_ENDPOINT)
+        # MathPixOCR may not provide confidence scores; setting default
+        default_confidence = 100.0
+        return math_text, default_confidence
+    except Exception as e:
+        logging.error(f"Math OCR failed: {e}")
+        return "", 0.0
+
+def handwrite_ocr(image: Image.Image) -> Tuple[str, float]:
+    """
+    Performs Handwriting OCR using specialized settings.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Extracted handwritten text and confidence score.
+    """
+    try:
+        # Placeholder for handwriting-specific OCR processing
+        # This could involve using a specialized model or service
+        # For demonstration, we'll use pytesseract with different configs
+        custom_config = r'--oem 1 --psm 7'  # OEM and PSM settings optimized for handwriting
+        data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
+        text = ' '.join(data['text'])
+        confidences = [int(conf) for conf in data['conf'] if conf.isdigit()]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return text, avg_conf
+    except Exception as e:
+        logging.error(f"Handwriting OCR failed: {e}")
+        return "", 0.0
+
+def table_ocr(image: Image.Image) -> Tuple[str, float]:
+    """
+    Performs Table OCR using specialized settings or libraries.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Extracted table text and confidence score.
+    """
+    try:
+        # Placeholder for table-specific OCR processing
+        # This could involve using libraries like camelot or tabula-py for structured tables
+        # For demonstration, we'll use pytesseract with grid recognition
+        custom_config = r'--oem 3 --psm 6'
+        data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
+        lines = {}
+        for i, word in enumerate(data['text']):
+            if word.strip() != '':
+                (x, y, w, h, conf) = (data['left'][i], data['top'][i], data['width'][i], data['height'][i], data['conf'][i])
+                lines.setdefault(y, []).append(word)
+        sorted_lines = [ ' '.join(words) for y, words in sorted(lines.items()) ]
+        text = '\n'.join(sorted_lines)
+        confidences = [int(conf) for conf in data['conf'] if conf.isdigit()]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return text, avg_conf
+    except Exception as e:
+        logging.error(f"Table OCR failed: {e}")
+        return "", 0.0
+
 async def ocr_image(image: Image.Image) -> Tuple[str, float]:
     """
-    Performs unified OCR on the given image using the selected OCR engine and backups.
+    Performs unified OCR on the given image using specialized OCRs based on text type.
 
     Args:
         image (Image.Image): The image to process.
@@ -335,20 +418,37 @@ async def ocr_image(image: Image.Image) -> Tuple[str, float]:
         for region in regions:
             x, y, w, h = region
             cropped_image = image.crop((x, y, x + w, y + h))
+            cropped_np = np.array(cropped_image)
 
-            # Choose OCR Engine
-            if OCR_ENGINE.lower() == "pytesseract":
+            # Perform OCR based on text type
+            text_type = classify_text_type(pytesseract.image_to_string(cropped_image))  # Initial classification
+            logging.info(f"Region classified as: {text_type}")
+
+            if text_type == "LaTeX":
+                text, conf = latex_ocr(cropped_image)
+            elif text_type == "Math":
+                text, conf = math_ocr(cropped_image)
+            elif text_type == "Handwrite":
+                text, conf = handwrite_ocr(cropped_image)
+            elif text_type == "Table":
+                text, conf = table_ocr(cropped_image)
+            elif text_type == "Figure":
+                # Assuming figures contain captions or labels; using standard OCR
                 text, conf = pytesseract_ocr(cropped_image)
-            elif OCR_ENGINE.lower() == "easyocr" and OCR_ENGINE_AVAILABLE:
-                text, conf = easyocr_ocr(cropped_image)
             else:
-                logging.warning(f"Unsupported OCR engine: {OCR_ENGINE}. Falling back to pytesseract.")
-                text, conf = pytesseract_ocr(cropped_image)
+                # Default OCR
+                if OCR_ENGINE.lower() == "pytesseract":
+                    text, conf = pytesseract_ocr(cropped_image)
+                elif OCR_ENGINE.lower() == "easyocr" and OCR_ENGINE_AVAILABLE:
+                    text, conf = easyocr_ocr(cropped_image)
+                else:
+                    logging.warning(f"Unsupported OCR engine: {OCR_ENGINE}. Falling back to pytesseract.")
+                    text, conf = pytesseract_ocr(cropped_image)
 
             extracted_text.append(text)
             confidences.append(conf)
 
-        combined_text = ' '.join(extracted_text)
+        combined_text = '\n'.join(extracted_text)
         avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
 
         # If confidence is low, use PaddleOCR as backup
@@ -366,50 +466,6 @@ async def ocr_image(image: Image.Image) -> Tuple[str, float]:
         logging.error(f"Error during OCR processing: {e}")
         return "", 0.0
 
-def process_handwritten_text_sync(image: Image.Image) -> Tuple[str, float]:
-    """
-    Processes handwritten text in the image using optimized OCR settings.
-
-    Args:
-        image (Image.Image): The image to process.
-
-    Returns:
-        Tuple[str, float]: Processed text and average confidence.
-    """
-    try:
-        # Placeholder for handwriting-specific OCR processing
-        # This could involve using a specialized model or service
-        # For demonstration, we'll use pytesseract with different configs
-        custom_config = r'--oem 1 --psm 7'  # OEM and PSM settings optimized for handwriting
-        data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
-        text = ' '.join(data['text'])
-        confidences = [int(conf) for conf in data['conf'] if conf.isdigit()]
-        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
-        return text, avg_conf
-    except Exception as e:
-        logging.error(f"Handwriting OCR failed: {e}")
-        return "", 0.0
-
-async def process_handwritten_text(text: str) -> str:
-    """
-    Processes handwritten text in the image using optimized OCR settings.
-
-    Args:
-        text (str): The text to process.
-
-    Returns:
-        str: Processed text.
-    """
-    try:
-        # Assuming 'text' is image data in some form; adjust as needed
-        image = Image.fromarray(np.array(text))
-        processed_text, conf = await asyncio.to_thread(process_handwritten_text_sync, image)
-        logging.info(f"Processed handwritten text with confidence: {conf:.2f}")
-        return processed_text
-    except Exception as e:
-        logging.error(f"Error processing handwritten text: {e}")
-        return text
-
 async def classify_and_process_text(text: str) -> str:
     """
     Classifies the text type and processes it accordingly using LLM.
@@ -425,7 +481,11 @@ async def classify_and_process_text(text: str) -> str:
 
     if text_type == "LaTeX" and PIX2TEX_OCR_AVAILABLE and LATEX_OCR_ENABLED:
         try:
-            latex_text, conf = await asyncio.to_thread(latex_ocr, Image.fromarray(np.array(text)))
+            # Convert text back to image if necessary
+            # Assuming text contains LaTeX code already extracted
+            # If text is image path or similar, adjust accordingly
+            # For demonstration, skipping image reconstruction
+            latex_text, conf = latex_ocr(Image.new('RGB', (100, 100)))  # Placeholder image
             logging.info("Processed LaTeX text with LaTeX OCR.")
             return latex_text if latex_text else text
         except Exception as e:
@@ -441,6 +501,10 @@ async def classify_and_process_text(text: str) -> str:
             return text
     elif text_type == "Handwrite":
         processed_text = await process_handwritten_text(text)
+        return processed_text
+    elif text_type == "Table":
+        # Optionally process tables differently
+        processed_text = await correct_ocr_errors(text)
         return processed_text
     else:
         # Standard text processing with OCR and LLM corrections
@@ -792,7 +856,10 @@ async def process_document(extracted_texts: List[str], reformat_as_markdown: boo
         structured_text = await identify_document_structure(latex_processed_text)
         
         # Reformat as Markdown if required
-        final_text = structured_text  # Placeholder for actual reformatting logic
+        if reformat_as_markdown:
+            final_text = await reformat_as_markdown_function(structured_text)
+        else:
+            final_text = structured_text  # Placeholder for actual reformatting logic
         
         return final_text
     except Exception as e:
