@@ -55,6 +55,14 @@ except ImportError:
     TEXT_DETECTION_AVAILABLE = False
     logging.warning("Text detection models (EAST/CRAFT) not found. Advanced text detection will not be used.")
 
+# Added pix2tex dependency for LaTeX OCR
+try:
+    from pix2tex.cli import LatexOCR
+    PIX2TEX_OCR_AVAILABLE = True
+except ImportError:
+    PIX2TEX_OCR_AVAILABLE = False
+    logging.warning("pix2tex library not found. LaTeX OCR will not be available.")
+
 # Configuration
 config = DecoupleConfig(RepositoryEnv('.env'))
 
@@ -96,6 +104,10 @@ PADDLEOCR_USE_GPU = config.get("PADDLEOCR_USE_GPU", default=False, cast=bool)
 # Added Text Detection configuration
 TEXT_DETECTION_MODEL = config.get("TEXT_DETECTION_MODEL", default="EAST", cast=str)  # Options: EAST, CRAFT
 TEXT_DETECTION_THRESHOLD = config.get("TEXT_DETECTION_THRESHOLD", default=0.5, cast=float)
+
+# Added LaTeX OCR configuration
+LATEX_OCR_ENABLED = config.get("LATEX_OCR_ENABLED", default=True, cast=bool)
+LATEX_OCR_LANGUAGE = config.get("LATEX_OCR_LANGUAGE", default="en", cast=str)  # e.g., 'en' for English
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -200,12 +212,15 @@ def classify_text_type(text: str) -> str:
         text (str): The text to classify.
 
     Returns:
-        str: The classified text type ('Math', 'Handwrite', or 'Text').
+        str: The classified text type ('Math', 'Handwrite', 'LaTeX', or 'Text').
     """
     math_pattern = r'[\$\\](.*?)[\$\\]'  # Detect LaTeX math
+    latex_pattern = r'\\[a-zA-Z]+\{.*?\}'  # Detect LaTeX commands
     handwriting_pattern = r'[A-Za-z]{1,}\b'  # Placeholder for handwriting detection
 
-    if re.search(math_pattern, text):
+    if re.search(latex_pattern, text):
+        return "LaTeX"
+    elif re.search(math_pattern, text):
         return "Math"
     elif re.search(handwriting_pattern, text):
         return "Handwrite"
@@ -275,6 +290,29 @@ def paddleocr_ocr(image: Image.Image) -> Tuple[str, float]:
         return text, avg_conf
     except Exception as e:
         logging.error(f"PaddleOCR failed: {e}")
+        return "", 0.0
+
+def latex_ocr(image: Image.Image) -> Tuple[str, float]:
+    """
+    Performs LaTeX OCR using pix2tex on the given image.
+
+    Args:
+        image (Image.Image): The image to process.
+
+    Returns:
+        Tuple[str, float]: Extracted LaTeX code and confidence score.
+    """
+    if not PIX2TEX_OCR_AVAILABLE or not LATEX_OCR_ENABLED:
+        logging.warning("LaTeX OCR is not available or disabled.")
+        return "", 0.0
+    try:
+        model = LatexOCR()
+        latex_code = model(image)
+        # pix2tex does not provide confidence scores, so we'll set a default value
+        default_confidence = 100.0
+        return latex_code, default_confidence
+    except Exception as e:
+        logging.error(f"LaTeX OCR failed: {e}")
         return "", 0.0
 
 async def ocr_image(image: Image.Image) -> Tuple[str, float]:
@@ -385,7 +423,15 @@ async def classify_and_process_text(text: str) -> str:
     text_type = classify_text_type(text)
     logging.info(f"Classified text as: {text_type}")
 
-    if text_type == "Math" and MATH_OCR_AVAILABLE:
+    if text_type == "LaTeX" and PIX2TEX_OCR_AVAILABLE and LATEX_OCR_ENABLED:
+        try:
+            latex_text, conf = await asyncio.to_thread(latex_ocr, Image.fromarray(np.array(text)))
+            logging.info("Processed LaTeX text with LaTeX OCR.")
+            return latex_text if latex_text else text
+        except Exception as e:
+            logging.error(f"LaTeX OCR processing failed: {e}")
+            return text
+    elif text_type == "Math" and MATH_OCR_AVAILABLE:
         try:
             math_text = await asyncio.to_thread(mathpixocr.process, text, MATH_OCR_API_KEY, MATH_OCR_ENDPOINT)
             logging.info("Processed math text with MathOCR.")
@@ -713,7 +759,7 @@ async def generate_completion_async(prompt: str, max_tokens: int = 5000) -> Opti
 async def process_document(extracted_texts: List[str], reformat_as_markdown: bool, suppress_headers_and_page_numbers: bool) -> str:
     """
     Processes the entire document by performing error correction, handwriting recognition,
-    math formula processing, and document structuring.
+    math formula processing, LaTeX OCR, and document structuring.
 
     Args:
         extracted_texts (List[str]): List of extracted texts from OCR.
@@ -736,8 +782,14 @@ async def process_document(extracted_texts: List[str], reformat_as_markdown: boo
         # Math OCR Processing
         math_processed_text = await process_math_formulas(handwritten_text)
         
+        # LaTeX OCR Processing
+        if PIX2TEX_OCR_AVAILABLE and LATEX_OCR_ENABLED:
+            latex_processed_text = await classify_and_process_text(math_processed_text)
+        else:
+            latex_processed_text = math_processed_text
+        
         # Document Structure Identification
-        structured_text = await identify_document_structure(math_processed_text)
+        structured_text = await identify_document_structure(latex_processed_text)
         
         # Reformat as Markdown if required
         final_text = structured_text  # Placeholder for actual reformatting logic
